@@ -9,6 +9,10 @@ from easydynamics.resolution import ResolutionHandler
 
 from easydynamics.sample.components import DeltaFunctionComponent
 
+from easydynamics.sample import SampleModel
+
+from easydynamics.experiment import Experiment
+
 
 import numpy as np
 
@@ -17,10 +21,14 @@ import scipp as sc
 import matplotlib.pyplot as plt
 
 class Analysis(AnalysisBase):
-    def __init__(self, name: str, interface=None, *args, **kwargs):
+    def __init__(self, name="MyAnalysis", interface=None, *args, **kwargs):
         super().__init__(name, *args, **kwargs)
         self._theory= None
         self._experiment= None
+        self._offset=Parameter(name='offset', value=0.0, unit='meV')
+
+        self._resolution_model = None
+        self._background_model = None
 
     def plot_data_and_model(self, plot_individual_components: bool = False):
         """
@@ -52,14 +60,14 @@ class Analysis(AnalysisBase):
             for comp in self._theory.components.values():
                 # comp_y = comp.evaluate(x - shift)
 
-                if self._experiment._resolution_model is None:
-                    y = comp.evaluate(x- self._experiment.offset.value)
+                if self._resolution_model is None:
+                    y = comp.evaluate(x- self._offset.value)
                 else:
                     resolution_handler = ResolutionHandler()
-                    y = resolution_handler.numerical_convolve(x, comp, self._experiment._resolution_model, self._experiment.offset)
+                    y = resolution_handler.numerical_convolve(x, comp, self._resolution_model, self._offset)
                     # If detailed balance is used, calculate the detailed balance factor. TODO: This should be handled before convolution.
                     if self._theory.use_detailed_balance and self._theory._temperature.value >= 0 and not isinstance(comp, DeltaFunctionComponent):
-                        y*=self._theory.detailed_balance_factor(x- self._experiment.offset.value, self._theory._temperature.value)
+                        y*=self._theory.detailed_balance_factor(x- self._offset.value, self._theory._temperature.value)
 
                 plt.plot(x, y, label=f'Component: {comp.name}', linestyle='--')
 
@@ -72,11 +80,23 @@ class Analysis(AnalysisBase):
 
         return fig
 
-    def set_theory(self, theory):
+    def set_theory(self, theory: SampleModel):
+        """ Set the model to be fitted.
+        Args:
+            theory (SampleModel): The theoretical model to be used in the analysis.
+        """
+        if not isinstance(theory, SampleModel):
+            raise TypeError("The theory must be an instance of SampleModel.")
         self._theory = theory
 
-    def set_experiment(self, experiment):
-        self._experiment = experiment   
+    def set_experiment(self, experiment: Experiment):
+        """ Set the experimental for the analysis.
+        Args:
+            experiment (Experiment): The experimental model to be used in the analysis.
+        """
+        if not isinstance(experiment, Experiment):
+            raise TypeError("The experiment must be an instance of Experiment.")
+        self._experiment = experiment
 
 
     def calculate_theory(self, x) -> np.ndarray:
@@ -85,16 +105,112 @@ class Analysis(AnalysisBase):
         and adding the background model.
         """
 
-        if self._experiment._resolution_model is None:
-            y = self._theory.evaluate(x- self._experiment.offset.value)
+        if self._resolution_model is None:
+            y = self._theory.evaluate(x- self._offset.value)
         else:
             resolution_handler = ResolutionHandler()
-            y = resolution_handler.numerical_convolve(x, self._theory, self._experiment._resolution_model, self._experiment.offset)
+            y = resolution_handler.numerical_convolve(x, self._theory, self._resolution_model, self._offset)
 
-        if self._experiment._background_model is not None:
-            y += self._experiment._background_model.evaluate(x)
+        if self._background_model is not None:
+            y += self._background_model.evaluate(x)
 
         return y
+    
+    def calculate_individual_components(self, x=None,add_background=True) -> dict:
+        """
+        Calculate the individual components of the theory model.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Energy axis (e.g., in meV).
+
+        Returns
+        -------
+        dict
+            A dictionary with component names as keys and evaluated values as values.
+        """
+
+        if self._theory is None:
+            raise RuntimeError("Theory model must be set before calculating components.")
+
+        # standard: use experimental data x if not provided
+        if x is None:
+            if self._experiment is None or self._experiment._data is None:
+                raise RuntimeError("No x values provided and no experiment data set.")
+            x, _, _ = self._experiment.extract_xye_data(self._experiment._data)
+
+
+
+        components = {}
+
+        if self._resolution_model is not None:
+            resolution_handler = ResolutionHandler()
+
+        for name, component in self._theory.components.items():
+            if self._resolution_model is None:
+                components[name] = component.evaluate(x - self._offset.value)
+            else:
+                components[name] = resolution_handler.numerical_convolve(x, component, self._resolution_model, self._offset)
+
+            if add_background and self._background_model is not None:
+                components[name] += self._background_model.evaluate(x - self._offset.value)
+
+        # If background model is set, add its components
+        if self._background_model is not None:
+            background_components = self._background_model.components.items()
+            for name, component in background_components:
+                components[name] = component.evaluate(x - self._offset.value)
+
+        return components
+
+    
+
+    def set_background_model(self, background:SampleModel):
+        """ Set the model for the background.
+        Args:
+            background (SampleModel): The background model.
+        """
+        if not isinstance(background, SampleModel):
+            raise TypeError("Background model must be an instance of SampleModel.")
+        self._background_model = background
+
+    def set_resolution_model(self, resolution:SampleModel):
+        """        Set the resolution model for the experiment. The resolution will be normalised to have area 1.
+        Args:
+            resolution (SampleModel): The resolution model to be used in the experiment.
+        """
+        # TODO: allow resolution to be DataArray or SampleModel
+
+        if resolution is not None and not isinstance(resolution, SampleModel):
+            raise TypeError("Resolution model must be an instance of SampleModel.")
+        self._resolution_model = resolution
+
+        if self._resolution_model is not None:
+            self.normalize_resolution()
+
+    def fix_resolution_parameters(self):
+        """ Fix all parameters in the resolution model.
+        """
+        if self._resolution_model is not None:
+            for param in self._resolution_model.get_parameters():
+                param.fixed = True
+
+    def normalize_resolution(self):
+        """ Normalize the resolution model to have an area of 1.
+        """
+        self._resolution_model.normalize_area()
+
+
+
+    def set_offset(self, offset: float):
+        # TODO: handle units properly
+        
+        self._offset.value= offset
+
+    def fix_offset(self, fix: bool = True):
+
+        self._offset.fixed = fix
 
 
     def fit(self):
@@ -150,12 +266,12 @@ class Analysis(AnalysisBase):
             params.extend(self._theory.get_parameters())
 
         if self._experiment is not None:
-            if self._experiment._resolution_model is not None:
-                params.extend(self._experiment._resolution_model.get_parameters())
-            if self._experiment._background_model is not None:
-                params.extend(self._experiment._background_model.get_parameters())
-            if hasattr(self._experiment, "offset"):
-                params.append(self._experiment.offset)
+            if self._resolution_model is not None:
+                params.extend(self._resolution_model.get_parameters())
+            if self._background_model is not None:
+                params.extend(self._background_model.get_parameters())
+
+        params.append(self._offset)
 
         return params
 

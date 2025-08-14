@@ -1,5 +1,5 @@
 import warnings
-from typing import Dict, List
+from typing import Dict, List, Union
 
 import numpy as np
 
@@ -21,7 +21,7 @@ class SampleModel(ObjBase):
     components : dict
         Dictionary of model components keyed by name.
     """
-    def __init__(self, name):
+    def __init__(self, name="MySampleModel", temperature=None):
         """
         Initialize a new SampleModel.
 
@@ -33,8 +33,12 @@ class SampleModel(ObjBase):
                 
         self.components: Dict[str, ModelComponent] = {}
         super().__init__(name=name)
-        self._temperature = Parameter(name="temperature", value=-1, unit='K', fixed=True)
-        self._use_detailed_balance = False
+        if temperature is not None:
+            self._temperature = Parameter(name="temperature", value=temperature, unit='K', fixed=True)
+            self._use_detailed_balance = True
+        else:
+            self._temperature=None
+            self._use_detailed_balance = False
 
     def add_component(self, component: ModelComponent):
         """
@@ -153,7 +157,7 @@ class SampleModel(ObjBase):
         return self._temperature
 
     @temperature.setter
-    def temperature(self, value: float):
+    def temperature(self, value: Union[float, None]):
         """
         Set the temperature.
 
@@ -164,15 +168,20 @@ class SampleModel(ObjBase):
         value : float
             Temperature value in Kelvin.
         """
-        if value < 0:
+        if value is None:
             self._use_detailed_balance = False
-            warnings.warn("Temperature is negative. Disabling detailed balance.")
+            self._temperature = None
+            return
+            # warnings.warn("Temperature is negative. Disabling detailed balance.") #TODO: Uncomment this line if you want to enable the warning
 
-        self._temperature.value = value
+        if isinstance(self._temperature, Parameter):
+            self._temperature.value = value
+        else:
+            self._temperature = Parameter(name="temperature", value=value, unit='K', fixed=True)
 
         if not self.use_detailed_balance:
             self.use_detailed_balance = value >= 0
-            print(f"Detailed balance set to {self.use_detailed_balance} for temperature {value} K")
+            # print(f"Detailed balance set to {self.use_detailed_balance} for temperature {value} K") # #TODO: Uncomment this line if you want to enable the warning
 
     @property
     def use_detailed_balance(self) -> bool:
@@ -279,7 +288,31 @@ class SampleModel(ObjBase):
         -------
         List[Parameter]
         """
-        params = [self._temperature]
+        if isinstance(self._temperature, Parameter):
+            params = [self._temperature]
+        else:
+            params = []
         for comp in self.components.values():
             params.extend(comp.get_parameters())
         return params
+    
+    def copy(self) -> "SampleModel":
+        """
+        Create a deep copy of the SampleModel with independent parameters.
+
+        Returns
+        -------
+        SampleModel
+            A new instance with copied components and parameters.
+        """
+        new_model = SampleModel(name=self.name, temperature=self._temperature.value if self._temperature else None)
+        # new_model.temperature = self._temperature.value
+        new_model.use_detailed_balance = self._use_detailed_balance
+
+
+        for comp in self.components.values():
+            new_model.add_component(comp.copy())
+
+            
+
+        return new_model

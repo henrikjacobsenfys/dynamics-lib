@@ -9,7 +9,7 @@ class Data(ExperimentBase):
         data : The experimental data.
     """
     
-    def __init__(self, name):
+    def __init__(self, name="MyData"):
         super().__init__(name)
         self.data = None
 
@@ -49,6 +49,33 @@ class Data(ExperimentBase):
         """
         raise NotImplementedError("Outlier removal is not implemented yet.")
     
+    def create_binned_data_1D(self, Q_bins=None, energy_bins=None):
+        """
+        Create a 1D data array from the existing data.
+        
+        Args:
+            Q_bins (int): Number of Q bins.
+            energy_bins (int): Number of energy bins.
+        
+        Returns:
+            sc.DataArray: 1D data array with Q and energy as coordinates.
+        """
+        if self.data is None:
+            raise ValueError("No data available to create 1D data.")
+        
+        # Assuming self.data is a 2D DataArray with dimensions ['Q', 'energy']
+        # TODO: Don't make this assumption
+        # This needs a lot of cleaning and to work with all sorts of data - this is just a proof of concept
+
+        if Q_bins is not None and energy_bins is not None:
+            binned_data=self.data.flatten(to='dummy').bin(energy=energy_bins,Q=Q_bins).bins.mean()
+        else:
+            binned_data=self.data
+
+        self.binned_data=binned_data
+        
+
+    
     def __repr__(self):
         """
         String representation of the Data object.
@@ -59,7 +86,7 @@ class Data(ExperimentBase):
         return f"Data(data={self.name})"
     
     def plot(self):
-        raise NotImplementedError("Plotting is not implemented yet. Use a plotting library to visualize the data.")
+        raise NotImplementedError("Plotting is not implemented yet.")
     
 
     
@@ -73,7 +100,7 @@ class Data(ExperimentBase):
         """
         NUMBER_OF_Q_POINTS=16
         NUMBER_OF_E_POINTS=1024
-        # TODO Add the correct Q values
+        Q_values = [  0.5708,    0.7002,    0.8262 ,   0.9485 ,   1.0664  ,  1.1793   , 1.2868 ,   1.3883 ,   1.4833 ,   1.5716  ,  1.6525  ,  1.7258  ,  1.7910 ,   1.8480  ,  1.8965 ,   1.9361]
         # [  0.5708,    0.7002,    0.8262 ,   0.9485 ,   1.0664  ,  1.1793   , 1.2868 ,   1.3883 ,   1.4833 ,   1.5716  ,  1.6525  ,  1.7258  ,  1.7910 ,   1.8480  ,  1.8965 ,   1.9361],unit='1/angstrom'
 
 
@@ -92,7 +119,7 @@ class Data(ExperimentBase):
             error_values[Q,:]=data_array[:,2]
 
         # Define energy, q and intensity as scipp variables with units, and make a DataArray
-        Q=sc.array(dims=['Q'],values=range(NUMBER_OF_Q_POINTS))
+        Q=sc.array(dims=['Q'],values=Q_values, unit='1/angstrom')
         energy=sc.array(dims=['energy'],values=energy_values/1000,unit='meV')
         intensity=sc.array(dims=['Q','energy'],values=intensity_values,variances=error_values*error_values) #The variance is the square of the uncertainty!
 
@@ -160,7 +187,90 @@ class Data(ExperimentBase):
 
         return GGG_data_450mK
 
+    @staticmethod
+    def load_example_data():
+        #Preallocate
+        # Load data into a matrix
 
+        NUMBER_OF_Q_POINTS=16
+        NUMBER_OF_E_POINTS=1024
+        Q_values = [  0.5708,    0.7002,    0.8262 ,   0.9485 ,   1.0664  ,  1.1793   , 1.2868 ,   1.3883 ,   1.4833 ,   1.5716  ,  1.6525  ,  1.7258  ,  1.7910 ,   1.8480  ,  1.8965 ,   1.9361]
+        intensity_values=np.zeros((NUMBER_OF_Q_POINTS,NUMBER_OF_E_POINTS))
+        error_values=np.zeros((NUMBER_OF_Q_POINTS,NUMBER_OF_E_POINTS))
+
+        for Q in range(NUMBER_OF_Q_POINTS):
+            filename = '../examples/QENS_example/IN16b_GGG_data/data_450mK_Q' +str(Q+1) +'.dat'
+
+            data_array = np.loadtxt(filename)
+            energy_values=data_array[:, 0] #should be the same for all Q
+            # EnergyValues[Q,:]=data_array[:, 0]
+            intensity_values[Q,:]=data_array[:,1]
+            error_values[Q,:]=data_array[:,2]
+
+        # Define energy, Q and intensity as scipp variables with units, and make a DataArray
+        Q=sc.array(dims=['Q'],values=Q_values, unit='1/angstrom')
+        energy=sc.array(dims=['energy'],values=energy_values/1000,unit='meV')
+        intensity=sc.array(dims=['Q','energy'],values=intensity_values,variances=error_values*error_values) #The variance is the square of the uncertainty!
+
+        GGG_data_450mK = sc.DataArray(data=intensity, coords={'Q': Q, 'energy': energy})
+
+        return GGG_data_450mK
+        # vanadium_data = sc.DataArray(data=intensity, coords={'Q':Q,'energy': energy})
+
+
+    @staticmethod
+    def load_example_data_3d():
+        # Inputs
+        NUMBER_OF_Q_POINTS = 16
+        Q_values = [0.5708, 0.7002, 0.8262, 0.9485, 1.0664, 1.1793, 1.2868, 1.3883,
+                    1.4833, 1.5716, 1.6525, 1.7258, 1.7910, 1.8480, 1.8965, 1.9361]
+        temps_mK = [60, 175, 450, 600, 1000]  # mK
+        file_tpl = '../examples/QENS_example/IN16b_GGG_data/data_{temp}mK_Q{q}.dat'
+
+        # Use first file to define the energy grid
+        first = np.loadtxt(file_tpl.format(temp=temps_mK[0], q=1))
+        energy_values = first[:, 0] / 1000.0  # meV 
+        NE = energy_values.shape[0]
+
+        # Preallocate (Temperature, Q, energy)
+        T = len(temps_mK)
+        intensity_values = np.zeros((T, NUMBER_OF_Q_POINTS, NE))
+        error_values     = np.zeros_like(intensity_values)
+
+        # Load all temps & Q
+        for ti, t in enumerate(temps_mK):
+            for qi in range(1, NUMBER_OF_Q_POINTS + 1):
+                arr = np.loadtxt(file_tpl.format(temp=t, q=qi))
+                en = arr[:, 0] / 1000.0
+                # Sanity: ensure same energy axis everywhere
+                if not np.allclose(en, energy_values, rtol=0.0, atol=1e-12):
+                    raise ValueError(f"Energy grid differs at {t} mK, Q index {qi}")
+                intensity_values[ti, qi-1, :] = arr[:, 1]
+                error_values[ti,    qi-1, :] = arr[:, 2]
+
+        # Build coords
+        Q = sc.array(dims=['Q'], values=Q_values, unit='1/angstrom')
+        energy = sc.array(dims=['energy'], values=energy_values, unit='meV')
+        Temperature = sc.array(dims=['Temperature'],
+                            values=[t/1000.0 for t in temps_mK], unit='K')
+
+        # Build data (variances = error^2)
+        intensity = sc.array(dims=['Temperature','Q','energy'],
+                            values=intensity_values,
+                            variances=error_values**2)
+
+        GGG_data = sc.DataArray(
+            data=intensity,
+            coords={'Temperature': Temperature, 'Q': Q, 'energy': energy}
+        )
+
+        return GGG_data
+        
+
+
+
+
+    
     @staticmethod
     def load_example_anesthetics_data_lowT():
         data = np.loadtxt('../examples/Anesthetics/data/BVC2K_q4.inx', skiprows=4)
