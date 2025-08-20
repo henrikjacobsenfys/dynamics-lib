@@ -1,13 +1,11 @@
 from easyscience.job.analysis import AnalysisBase
 from easyscience.fitting import AvailableMinimizers
-from easyscience.fitting import FitResults
 from easyscience.fitting.fitter import Fitter as EasyScienceFitter
 
 from easyscience.variable import Parameter
 
 from easydynamics.resolution import ResolutionHandler
 
-from easydynamics.sample.components import DeltaFunctionComponent
 
 from easydynamics.sample import SampleModel
 
@@ -32,56 +30,6 @@ class Analysis(AnalysisBase):
         self._resolution_model = None
         self._background_model = None
 
-    def plot_data_and_model(self, plot_individual_components: bool = False):
-        """
-        Plot the experimental data and the theoretical fit.
-
-        Args:
-            plot_individual_components (bool): If True, plots individual components of the theory model.
-        """
-        if self._experiment is None or self._theory is None:
-            raise RuntimeError("Experiment and theory must be set before plotting.")
-
-        if self._experiment._data is None:
-            raise RuntimeError("No data has been set in the experiment.")
-
-        # Extract data
-        x, y, e = self._experiment.extract_xye_data(self._experiment._data)
-
-        # Start plot
-        fig = plt.figure(figsize=(10, 6))
-        plt.errorbar(x, y, yerr=e, label='Data', color='black', marker='o', linestyle='None', markerfacecolor='none')
-
-        # Compute and plot fit
-        fit_y = self.calculate_theory(x)
-        plt.plot(x, fit_y, label='Fit', color='red')
-
-        # Plot individual components, shifted by offset
-        #TODO: handle resolution convolution
-        if plot_individual_components:
-            for comp in self._theory.components.values():
-                # comp_y = comp.evaluate(x - shift)
-
-                if self._resolution_model is None:
-                    y = comp.evaluate(x- self._offset.value)
-                else:
-                    resolution_handler = ResolutionHandler()
-                    y = resolution_handler.convolve(x, comp, self._resolution_model, self._offset)
-                    # If detailed balance is used, calculate the detailed balance factor. TODO: This should be handled before convolution.
-                    if self._theory.use_detailed_balance and self._theory._temperature.value >= 0 and not isinstance(comp, DeltaFunctionComponent):
-                        y*=self._theory.detailed_balance_factor(x- self._offset.value, self._theory._temperature.value)
-
-                plt.plot(x, y, label=f'Component: {comp.name}', linestyle='--')
-
-        # Labels and legend
-        plt.xlabel('Energy (meV)')  # TODO: Handle units 
-        plt.ylabel('Intensity')
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-        return fig
-
     def set_theory(self, theory: SampleModel):
         """ Set the model to be fitted.
         Args:
@@ -91,8 +39,6 @@ class Analysis(AnalysisBase):
             raise TypeError("The theory must be an instance of SampleModel.")
         self._theory = theory
 
-        
-
     def set_experiment(self, experiment: Experiment):
         """ Set the experimental for the analysis.
         Args:
@@ -101,75 +47,6 @@ class Analysis(AnalysisBase):
         if not isinstance(experiment, Experiment):
             raise TypeError("The experiment must be an instance of Experiment.")
         self._experiment = experiment
-
-
-    def calculate_theory(self, x) -> np.ndarray:
-        """
-        Calculate the theoretical model by convolving the sample model with the resolution model
-        and adding the background model.
-        """
-
-        if self._resolution_model is None:
-            y = self._theory.evaluate(x- self._offset.value)
-        else:
-            resolution_handler = ResolutionHandler()
-            y = resolution_handler.convolve(x, self._theory, self._resolution_model, self._offset)
-
-        if self._background_model is not None:
-            y += self._background_model.evaluate(x)
-
-        return y
-    
-    def calculate_individual_components(self, x=None,add_background=True) -> dict:
-        # TODO: add/check handling of detailed balance
-        """
-        Calculate the individual components of the theory model.
-
-        Parameters
-        ----------
-        x : np.ndarray
-            Energy axis (e.g., in meV).
-
-        Returns
-        -------
-        dict
-            A dictionary with component names as keys and evaluated values as values.
-        """
-
-        if self._theory is None:
-            raise RuntimeError("Theory model must be set before calculating components.")
-
-        # standard: use experimental data x if not provided
-        if x is None:
-            if self._experiment is None or self._experiment._data is None:
-                raise RuntimeError("No x values provided and no experiment data set.")
-            x, _, _ = self._experiment.extract_xye_data(self._experiment._data)
-
-
-
-        components = {}
-
-        if self._resolution_model is not None:
-            resolution_handler = ResolutionHandler()
-
-        for name, component in self._theory.components.items():
-            if self._resolution_model is None:
-                components[name] = component.evaluate(x - self._offset.value)
-            else:
-                components[name] = resolution_handler.convolve(x, component, self._resolution_model, self._offset)
-
-            if add_background and self._background_model is not None:
-                components[name] += self._background_model.evaluate(x - self._offset.value)
-
-        # If background model is set, add its components
-        if self._background_model is not None:
-            background_components = self._background_model.components.items()
-            for name, component in background_components:
-                components[name] = component.evaluate(x - self._offset.value)
-
-        return components
-
-    
 
     def set_background_model(self, background:SampleModel):
         """ Set the model for the background.
@@ -206,17 +83,75 @@ class Analysis(AnalysisBase):
         """
         self._resolution_model.normalize_area()
 
-
-
-    def set_offset(self, offset: float):
+    def set_offset(self, offset: float,unit):
         # TODO: handle units properly
-        
-        self._offset.value= offset
+        self._offset.value = offset
 
     def fix_offset(self, fix: bool = True):
-
         self._offset.fixed = fix
 
+    def calculate_theory(self, x) -> np.ndarray:
+        """
+        Calculate the theoretical model by convolving the sample model with the resolution model
+        and adding the background model.
+        """
+
+        if self._resolution_model is None:
+            y = self._theory.evaluate(x- self._offset.value)
+        else:
+            resolution_handler = ResolutionHandler()
+            y = resolution_handler.convolve(x, self._theory, self._resolution_model, self._offset)
+
+        if self._background_model is not None:
+            y += self._background_model.evaluate(x)
+
+        return y
+    
+    def calculate_individual_components(self, x=None,add_background=True) -> dict:
+        """
+        Calculate the individual components of the theory model.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Energy axis (e.g., in meV).
+
+        Returns
+        -------
+        dict
+            A dictionary with component names as keys and evaluated values as values.
+        """
+
+        if self._theory is None:
+            raise RuntimeError("Theory model must be set before calculating components.")
+
+        # standard: use experimental data x if not provided
+        if x is None:
+            if self._experiment is None or self._experiment._data is None:
+                raise RuntimeError("No x values provided and no experiment data set.")
+            x, _, _ = self._experiment.extract_xye_data(self._experiment._data)
+
+        components = {}
+
+        if self._resolution_model is not None:
+            resolution_handler = ResolutionHandler()
+
+        for name, component in self._theory.components.items():
+            if self._resolution_model is None:
+                components[name] = component.evaluate(x - self._offset.value)
+            else:
+                components[name] = resolution_handler.convolve(x=x, sample_model=self._theory, resolution_model=self._resolution_model, offset=self._offset, selected_component_name=name)
+
+            if add_background and self._background_model is not None:
+                components[name] += self._background_model.evaluate(x - self._offset.value)
+
+        # If background model is set, add its components
+        if self._background_model is not None:
+            background_components = self._background_model.components.items()
+            for name, component in background_components:
+                components[name] = component.evaluate(x - self._offset.value)
+
+        return components
 
     def fit(self):
 
@@ -249,6 +184,43 @@ class Analysis(AnalysisBase):
 
         return fit_result
     
+    def plot_data_and_model(self, plot_individual_components: bool = False):
+        """
+        Plot the experimental data and the theoretical fit.
+
+        Args:
+            plot_individual_components (bool): If True, plots individual components of the theory model.
+        """
+        if self._experiment is None or self._theory is None:
+            raise RuntimeError("Experiment and theory must be set before plotting.")
+
+        if self._experiment._data is None:
+            raise RuntimeError("No data has been set in the experiment.")
+
+        # Extract data
+        x, y, e = self._experiment.extract_xye_data(self._experiment._data)
+
+        # Start plot
+        fig = plt.figure(figsize=(10, 6))
+        plt.errorbar(x, y, yerr=e, label='Data', color='black', marker='o', linestyle='None', markerfacecolor='none')
+
+        # Compute and plot fit
+        fit_y = self.calculate_theory(x)
+        plt.plot(x, fit_y, label='Model', color='red')
+
+        if plot_individual_components:
+            components=self.calculate_individual_components()
+            for name, y in components.items():
+                plt.plot(x, y, label=f' {name}', linestyle='--')
+
+        # Labels and legend
+        plt.xlabel('Energy (meV)')  # TODO: Handle units 
+        plt.ylabel('Intensity')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        return fig    
 
     def seed_from(
         self,
