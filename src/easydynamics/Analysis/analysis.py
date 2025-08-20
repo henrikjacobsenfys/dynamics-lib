@@ -13,6 +13,8 @@ from easydynamics.sample import SampleModel
 
 from easydynamics.experiment import Experiment
 
+from typing import Iterable, Dict, Tuple, Optional
+
 
 import numpy as np
 
@@ -64,7 +66,7 @@ class Analysis(AnalysisBase):
                     y = comp.evaluate(x- self._offset.value)
                 else:
                     resolution_handler = ResolutionHandler()
-                    y = resolution_handler.numerical_convolve(x, comp, self._resolution_model, self._offset)
+                    y = resolution_handler.convolve(x, comp, self._resolution_model, self._offset)
                     # If detailed balance is used, calculate the detailed balance factor. TODO: This should be handled before convolution.
                     if self._theory.use_detailed_balance and self._theory._temperature.value >= 0 and not isinstance(comp, DeltaFunctionComponent):
                         y*=self._theory.detailed_balance_factor(x- self._offset.value, self._theory._temperature.value)
@@ -89,6 +91,8 @@ class Analysis(AnalysisBase):
             raise TypeError("The theory must be an instance of SampleModel.")
         self._theory = theory
 
+        
+
     def set_experiment(self, experiment: Experiment):
         """ Set the experimental for the analysis.
         Args:
@@ -109,7 +113,7 @@ class Analysis(AnalysisBase):
             y = self._theory.evaluate(x- self._offset.value)
         else:
             resolution_handler = ResolutionHandler()
-            y = resolution_handler.numerical_convolve(x, self._theory, self._resolution_model, self._offset)
+            y = resolution_handler.convolve(x, self._theory, self._resolution_model, self._offset)
 
         if self._background_model is not None:
             y += self._background_model.evaluate(x)
@@ -117,6 +121,7 @@ class Analysis(AnalysisBase):
         return y
     
     def calculate_individual_components(self, x=None,add_background=True) -> dict:
+        # TODO: add/check handling of detailed balance
         """
         Calculate the individual components of the theory model.
 
@@ -151,7 +156,7 @@ class Analysis(AnalysisBase):
             if self._resolution_model is None:
                 components[name] = component.evaluate(x - self._offset.value)
             else:
-                components[name] = resolution_handler.numerical_convolve(x, component, self._resolution_model, self._offset)
+                components[name] = resolution_handler.convolve(x, component, self._resolution_model, self._offset)
 
             if add_background and self._background_model is not None:
                 components[name] += self._background_model.evaluate(x - self._offset.value)
@@ -243,6 +248,87 @@ class Analysis(AnalysisBase):
         self.fit_result = fit_result
 
         return fit_result
+    
+
+    def seed_from(
+        self,
+        other: "Analysis",
+        *,
+        domains: Iterable[str] = ("theory", "background", "resolution"),
+        only_unfixed: bool = True,
+        strict_components: bool = True,
+        strict_params: bool = True,
+        include_temperature: bool = False,
+        require_same_units: bool = True,
+        convert_units: bool = False,
+        copy_offset: bool = True,
+    ) -> Dict[str, Dict[str, Tuple[float, float]]]:
+        """
+        Copy parameter *values* from `other` into this Analysis, domain by domain.
+
+        Parameters
+        ----------
+        other : Analysis
+            Source analysis whose current parameter values will be used.
+        domains : ('theory','background','resolution')
+            Which SampleModels to seed.
+        only_unfixed : bool
+            If True, skip fixed params in *this* analysis.
+        strict_components : bool
+            If True, require identical component-name sets; else use intersection.
+        strict_params : bool
+            If True, require identical parameter-name sets per component; else use intersection.
+        include_temperature : bool
+            If True, copy model temperature (when present on both).
+        require_same_units : bool
+            If True, raise on unit mismatch; otherwise allow.
+        convert_units : bool
+            If True, convert this analysis' param units to match `other` before copying values.
+        copy_offset : bool
+            If True, also copy `other._offset.value` → `self._offset.value` (unless fixed here).
+
+        Returns
+        -------
+        Dict[str, Dict[str, Tuple[old, new]]]
+            Per-domain reports of value changes; 'offset' reported under key 'analysis'.
+        """
+        if not isinstance(other, Analysis):
+            raise TypeError("seed_from: `other` must be an Analysis")
+
+        report: Dict[str, Dict[str, Tuple[float, float]]] = {}
+
+        def _maybe_update(domain_name: str,
+                          this_model: Optional[SampleModel],
+                          other_model: Optional[SampleModel]):
+            if this_model is None or other_model is None:
+                return
+            rep = this_model.update_values_from(
+                other_model,
+                only_unfixed=only_unfixed,
+                strict_components=strict_components,
+                strict_params=strict_params,
+                include_temperature=include_temperature,
+                require_same_units=require_same_units,
+                convert_units=convert_units,
+            )
+            if rep:
+                report[domain_name] = rep
+
+        if "theory" in domains:
+            _maybe_update("theory", self._theory, other._theory)
+        if "background" in domains:
+            _maybe_update("background", self._background_model, other._background_model)
+        if "resolution" in domains:
+            _maybe_update("resolution", self._resolution_model, other._resolution_model)
+
+        # Copy analysis-level offset value
+        if copy_offset and hasattr(self, "_offset") and hasattr(other, "_offset"):
+            if not getattr(self._offset, "fixed", False):
+                old = self._offset.value
+                self._offset.value = other._offset.value
+                report.setdefault("analysis", {})["offset"] = (old, self._offset.value)
+
+        return report
 
     def switch_minimizer(self, minimizer: AvailableMinimizers) -> None:
         """
