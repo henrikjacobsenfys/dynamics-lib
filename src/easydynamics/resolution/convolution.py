@@ -12,6 +12,7 @@ from easydynamics.sample import SampleModel
 
 from easyscience.variable import Parameter
 
+import warnings
 
 class ResolutionHandler:
 
@@ -23,11 +24,13 @@ class ResolutionHandler:
         offset: Union[Parameter, float, None] = None,
         method: str = 'analytical',
         upsample_factor: int = 0,
+        extension_factor: float = 0.2,
         selected_component_name: Union[str, None] = None
     ) -> np.ndarray:
         """
         Convolve a sample model with a resolution model using analytical expressions or numerical FFT.
         Accepts SampleModel or ModelComponent for both sample and resolution.
+        The analytical method silently falls back to numerical convolution if no analytical expression is found.
         """
 
         x = np.asarray(x, dtype=float)
@@ -45,11 +48,23 @@ class ResolutionHandler:
         if method == 'analytical':
             if isinstance(sample_model,SampleModel) and sample_model._use_detailed_balance:
                 raise ValueError("Analytical convolution is not supported with detailed balance.")
-            return self._analytical_convolve(x, sample_model, resolution_model, offset, upsample_factor,selected_component_name)
-        
+            return self._analytical_convolve(x=x, 
+                                             sample_model=sample_model, 
+                                             resolution_model=resolution_model, 
+                                             offset=offset, 
+                                             upsample_factor=upsample_factor, 
+                                             extension_factor=extension_factor, 
+                                             selected_component_name=selected_component_name)
+
         if method == 'numerical':
-            return self._numerical_convolve(x, sample_model, resolution_model, offset, upsample_factor,selected_component_name)
-        
+            return self._numerical_convolve(x=x, 
+                                             sample_model=sample_model, 
+                                             resolution_model=resolution_model, 
+                                             offset=offset, 
+                                             upsample_factor=upsample_factor, 
+                                             extension_factor=extension_factor, 
+                                             selected_component_name=selected_component_name)
+
         if method not in ['analytical', 'numerical']:
             raise ValueError(f"Unknown convolution method: {method}. Choose from 'analytical', or 'numerical'.")
 
@@ -61,6 +76,7 @@ class ResolutionHandler:
         resolution_model: Union[SampleModel, ModelComponent, Callable[[np.ndarray], np.ndarray]],
         offset: Union[Parameter, np.ndarray, None] = None,
         upsample_factor: int = 5,
+        extension_factor: float = 0.2,
         selected_component_name: Union[str, None] = None
     ) -> np.ndarray:
         """
@@ -70,14 +86,16 @@ class ResolutionHandler:
           - SampleModel
           - ModelComponent
           - Callable: f(x: np.ndarray) -> np.ndarray
+        offset: Union[Parameter, np.ndarray, None]: The offset on the x axis
+        upsample_factor: int: The factor by which to upsample the input array to improve resolution
+        extension_factor: float: The factor by which to extend the range of the input array to improve accuracy at the edges
+        selected_component_name: Union[str, None]: If provided, the name of the component to be selected for evaluation
         """
         
         x = np.asarray(x, dtype=float)
         if x.ndim != 1 or not np.all(np.isfinite(x)):
             raise ValueError("`x` must be a 1D finite array.")
 
-
-        #TODO: Add support for more span for the dense grid
         def is_uniform(xarr, rtol=1e-5):
             dx = np.diff(xarr)
             return np.allclose(dx, dx[0], rtol=rtol)
@@ -90,7 +108,7 @@ class ResolutionHandler:
         else:
             x_min, x_max = x.min(), x.max()
             span = (x_max - x_min)
-            extra = 0.2 * span
+            extra = extension_factor * span
             extended_min = x_min - extra
             extended_max = x_max + extra
             num_points = len(x) * upsample_factor
@@ -103,20 +121,25 @@ class ResolutionHandler:
             off=offset
         else:
             raise TypeError(f"Expected offset to be Parameter, float, or None, got {type(offset)}")
-
+        
+        dx= (x_dense[1] - x_dense[0])
+        span = x_dense.max() - x_dense.min()
         # Handle offset for even length of x in convolution
         if len(x_dense) %2  == 0:
-            off2 = -0.5 * (x_dense[1] - x_dense[0])
+            off2 = -0.5 * dx
         else:
             off2 = 0.0
 
         # Handle the case when x is not symmetric around zero. The resolution is still centered around zero (or close to it), so it needs to be evaluated there.
         if not np.isclose(x_dense.mean(), 0.0):
-            span = x_dense.max() - x_dense.min()
             x_dense_resolution = np.linspace(-0.5 * span, 0.5 * span, len(x_dense))
         else:
             x_dense_resolution = x_dense
         
+        # Give warnings if peaks are very wide or very narrow
+        self._check_width_thresholds(sample_model, span, dx, "sample model")
+        self._check_width_thresholds(resolution_model, span, dx, "resolution model")
+
         # Evaluate on dense grid
         sample_vals = self._evaluate_any(sample_model, x_dense - off - off2, selected_component_name)
         resolution_vals = self._evaluate_any(resolution_model, x_dense_resolution)
@@ -155,6 +178,7 @@ class ResolutionHandler:
         resolution_model: Union[SampleModel, ModelComponent],
         offset: Union[Parameter, float, None] = None,
         upsample_factor: int = 5,
+        extension_factor: float = 0.2,
         selected_component_name: Union[str, None] = None
     ) -> np.ndarray:
         """
@@ -212,7 +236,8 @@ class ResolutionHandler:
                     sample_model=s,                 # single component
                     resolution_model=rsum,          # sum of components that cannot be handled analytically
                     offset=offset,
-                    upsample_factor=upsample_factor
+                    upsample_factor=upsample_factor,
+                    extension_factor=extension_factor,
                 )
 
         return total
@@ -295,4 +320,36 @@ class ResolutionHandler:
             return m.evaluate(x)
         raise TypeError(f"Expected SampleModel, ModelComponent, or callable, got {type(m)}")
 
-
+    @staticmethod
+    def _check_width_thresholds(model, span, dx, model_type):
+        """
+        Helper function to check and warn about width thresholds for a given model or component.
+        Parameters:
+        - model: ModelComponent or SampleModel
+        - span: Range of the input data
+        - dx: Bin spacing of the input data
+        - model_type: 'sample model' or 'resolution model' for proper warning messages
+        """
+        LARGE_WIDTH_THRESHOLD = 0.1  # Threshold for large widths compared to span
+        SMALL_WIDTH_THRESHOLD = 0.5  # Threshold for small widths compared to bin spacing
+        
+        # Handle SampleModel or ModelComponent
+        if isinstance(model, SampleModel):
+            components = model.components.values()
+        else:
+            components = [model]  # Treat single ModelComponent as a list of one
+        
+        for comp in components:
+            if hasattr(comp, 'width'):
+                if comp.width.value > LARGE_WIDTH_THRESHOLD * span:
+                    warnings.warn(
+                        f"The width of the {model_type} component '{comp.name}' ({comp.width.value}) is large compared to the span of the input "
+                        f"array ({span}). This may lead to inaccuracies in the convolution.",
+                        UserWarning
+                    )
+                if comp.width.value < SMALL_WIDTH_THRESHOLD * dx:
+                    warnings.warn(
+                        f"The width of the {model_type} component '{comp.name}' ({comp.width.value}) is small compared to the spacing of the input "
+                        f"array ({dx}). This may lead to inaccuracies in the convolution.",
+                        UserWarning
+                    )
