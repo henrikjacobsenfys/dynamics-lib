@@ -3,14 +3,24 @@ from easyscience.job.job import JobBase
 from easydynamics.sample import SampleModel
 from easydynamics.experiment import Experiment
 from easydynamics.analysis import Analysis
-from easydynamics.experiment.data import Data
+
+from easydynamics.sample import ModelComponent
+
+from easydynamics.sample import DiffusionModel
+
+from easyscience.fitting.multi_fitter import MultiFitter as EasyScienceMultiFitter
+import numpy as np
+from easyscience.base_classes import ObjBase
+from easyscience.fitting.fitter import Fitter as EasyScienceFitter
+
 
 import scipp as sc
 import plopp as pp
 
 from collections import defaultdict, Counter
 
-import numpy as np
+from easydynamics.experiment.data import Data
+
 
 from itertools import product
 
@@ -29,7 +39,18 @@ class Job(JobBase):
         self._summary = None
         self._info = None
         self._fit_parameters = None
+        self._diffusion_model = None
 
+    
+    def set_diffusion_model(self, diffusion_model:DiffusionModel):
+        """ Set the diffusion model for the analysis.
+        Args:
+            diffusion_model (DiffusionModel): The diffusion model to be used in the analysis.
+        """
+        if not isinstance(diffusion_model, DiffusionModel):
+            raise TypeError("The diffusion model must be an instance of DiffusionModel.")
+        self._diffusion_model = diffusion_model
+        self.set_theory_for_all_analyses(diffusion_model)
 
     def set_theory(self, theory):
         """ Set the theoretical model.
@@ -209,6 +230,64 @@ class Job(JobBase):
                     ana.fit()
                     prev_ana = ana
 
+
+
+    def fit_simultaneous(self):
+        """
+        Fit all analyses simultaneously.
+            """
+        def _iter_nested(container, dims, sizes, depth=0, prefix=()):
+                """
+                Yields (index_tuple, leaf_item) for an N-D rectangular nested list/array.
+                dims: tuple like ('T','Q', 'something', ...)
+                sizes: dict mapping dim -> length
+                """
+                if depth == len(dims):
+                    yield prefix, container
+                    return
+                dim = dims[depth]
+                n = sizes[dim]
+                for i in range(n):
+                    # assumes rectangular indexing: container[i] is defined
+                    yield from _iter_nested(container[i], dims, sizes, depth+1, prefix + (i,))
+
+        x_data = []
+        y_data = []
+        e_data = []
+        fit_objects = []
+        fit_functions = []
+
+
+        dims  = tuple(self._analysis_meta['dims'])   # e.g. ('T','Q',...)
+        sizes = dict(self._analysis_meta['sizes'])   # {'T':4,'Q':16,...}
+        # q_axis = dims.index('Q')                     # works for any position
+
+        for idx, ana in _iter_nested(self._analysis, dims, sizes):
+            
+        # for ana in self._analysis:
+            # x, y, e = ana._experiment.extract_xye_data(self._experiment._data)
+            y=ana._experiment._data.data.values
+            x=ana._experiment._data.data.coords['energy'].values
+            e=np.sqrt(ana._experiment._data.data.variances)
+            x_data.append(x)
+            y_data.append(y)
+            e_data.append(e)
+            fit_objects.append(ana)
+            fit_functions.append(ana.calculate_theory)
+
+        multi_fitter = EasyScienceMultiFitter(
+            fit_objects=fit_objects,
+            fit_functions=fit_functions,
+        )
+            # x, y, e = self._experiment.extract_xye_data(self._experiment._data)
+
+
+        # Perform the fit
+        fit_result = multi_fitter.fit(x=x_data, y=y_data, weights=[1.0 / e for e in e_data])
+
+        return fit_result
+
+
     def generate_analysis_for_cuts(self, keep=('energy',)):
         """
         Create a nested structure of Analysis objects by cutting the experiment data
@@ -255,6 +334,7 @@ class Job(JobBase):
                 ana.set_background_model(self._background_model.copy())
             if self._resolution_model is not None:
                 ana.set_resolution_model(self._resolution_model.copy())
+                ana.fix_resolution_parameters()
 
             # Attach sliced data via Experiment/Data
             exp = Experiment()
@@ -487,6 +567,266 @@ class Job(JobBase):
 
         return self
 
+
+    # def generate_diffusion_analysis(self,diffusion_model):
+
+    def generate_empty_analysis_array(self,keep=('energy')):
+        """
+        Create a nested structure of Analysis objects by cutting the experiment data
+        over all dims NOT in `keep` (default keeps 'energy'). No theory or background is added here.
+
+        Result:
+        self._analysis  -> nested list with one level per cut-dimension, in the
+                            same order as they appear in the data (excluding `keep`).
+                            e.g. data.dims = ('Temperature','Q','energy')
+                                -> self._analysis[ti][qi]
+        self._analysis_meta -> metadata about the grid.
+        Each Analysis gets:
+            - _cut_indices : dict {dim: index}
+            - _cut_coords  : dict {dim: coord value/variable}
+        """
+        data = self._experiment._data.data
+
+        # Normalize `keep` to a tuple
+        if isinstance(keep, str):
+            keep = (keep,)
+        else:
+            keep = tuple(keep)
+
+        # Dims we cut over = all dims not kept
+        dims_to_cut = [d for d in data.dims if d not in keep]
+        sizes = {d: data.sizes[d] for d in dims_to_cut}
+        coords = {d: data.coords.get(d, None) for d in dims_to_cut}
+
+        # Helper: make one Analysis for a given index tuple over dims_to_cut
+        def make_analysis(idx_tuple):
+            # Slice 1D/kept-dims-only spectrum
+            da = data
+            for d, i in zip(dims_to_cut, idx_tuple):
+                da = da[d, i]
+            # Build analysis (copy models)
+            ana = Analysis(name=f'Analysis{idx_tuple}')
+
+
+            # Attach sliced data via Experiment/Data
+            exp = Experiment()
+            dat = Data()
+            dat.append(da)
+            exp.set_data(dat)
+            ana.set_experiment(exp)
+
+            # Annotate for traceability
+            ana._cut_indices = dict(zip(dims_to_cut, idx_tuple))
+            ana._cut_coords = {}
+            for d, i in zip(dims_to_cut, idx_tuple):
+                c = coords[d]
+                if c is None:
+                    ana._cut_coords[d] = None
+                else:
+                    try:
+                        # Prefer scalar value if available
+                        ana._cut_coords[d] = c[i].value
+                    except Exception:
+                        # Fall back to Variable/DataArray slice
+                        ana._cut_coords[d] = c[i]
+            return ana
+
+        # Build a nested list with one level per cut dimension
+        def build_level(level, prefix):
+            if level == len(dims_to_cut):
+                return make_analysis(prefix)
+            d = dims_to_cut[level]
+            return [build_level(level + 1, prefix + (i,)) for i in range(sizes[d])]
+
+        # Construct the grid (or a single Analysis if there are no cut dims)
+        analysis_grid = build_level(0, ())
+
+        # Save results
+        self._analysis = analysis_grid
+        self._analysis_meta = {
+            'dims': tuple(dims_to_cut),       # order of nesting
+            'sizes': sizes,                   # size per cut-dim
+            'keep': tuple(keep),              # dims left intact in each slice
+        }
+        return self
+    
+    def set_resolution_model_for_all_analyses(self, resolution=None):
+        """ Set the resolution model for all analyses in self._analysis.
+        Args:
+            resolution (SampleModel): The resolution model to be used in the experiment.
+        """
+        if resolution is None:
+            resolution = self._resolution_model
+
+        if not isinstance(resolution, SampleModel):
+            raise TypeError("Resolution model must be an instance of SampleModel.")
+        
+        def _walk_all(node):
+            """Yield every Analysis in the nested structure."""
+            stack = [node]
+            while stack:
+                x = stack.pop()
+                if isinstance(x, (list, tuple)):
+                    stack.extend(x)
+                else:
+                    yield x
+
+        for ana in _walk_all(self._analysis):
+            ana.set_resolution_model(resolution.copy())
+            ana.fix_resolution_parameters()
+
+        return self
+    
+    def set_background_model_for_all_analyses(self, background=None):
+        """ Set the background model for all analyses in self._analysis.
+        Args:
+            background (SampleModel): The background model to be used in the experiment.
+        """
+        if background is None:
+            background = self._background_model
+
+        if not isinstance(background, SampleModel):
+            raise TypeError("Background model must be an instance of SampleModel.")
+        
+        def _walk_all(node):
+            """Yield every Analysis in the nested structure."""
+            stack = [node]
+            while stack:
+                x = stack.pop()
+                if isinstance(x, (list, tuple)):
+                    stack.extend(x)
+                else:
+                    yield x
+
+        for ana in _walk_all(self._analysis):
+            ana.set_background_model(background.copy())
+
+        return self
+    
+    def set_theory_for_all_analyses(self, theory=None):
+        def _iter_nested(container, dims, sizes, depth=0, prefix=()):
+            """
+            Yields (index_tuple, leaf_item) for an N-D rectangular nested list/array.
+            dims: tuple like ('T','Q', 'something', ...)
+            sizes: dict mapping dim -> length
+            """
+            if depth == len(dims):
+                yield prefix, container
+                return
+            dim = dims[depth]
+            n = sizes[dim]
+            for i in range(n):
+                # assumes rectangular indexing: container[i] is defined
+                yield from _iter_nested(container[i], dims, sizes, depth+1, prefix + (i,))
+
+        if theory is None:
+            theory = self._theory
+        if isinstance(theory,DiffusionModel):
+            # diffusion_job._experiment._data.data.coords.get('Q').values
+            Q=self._experiment._data.data.coords.get('Q').values
+            components=theory.create_components(Q)
+
+            dims  = tuple(self._analysis_meta['dims'])   # e.g. ('T','Q',...)
+            sizes = dict(self._analysis_meta['sizes'])   # {'T':4,'Q':16,...}
+            q_axis = dims.index('Q')                     # works for any position
+
+            for idx, ana in _iter_nested(self._analysis, dims, sizes):
+                q_i = idx[q_axis]                        # the Q index for this analysis
+                if ana._theory is None:
+                    sample_model = SampleModel()
+                else:
+                    sample_model = ana._theory
+
+                for comp in components[q_i]:
+                    sample_model.add_component(comp)
+                    
+                    ana.set_theory(sample_model)
+                    ana.set_diffusion_model(theory)
+
+        if isinstance(theory,ModelComponent):
+            dims  = tuple(self._analysis_meta['dims'])   # e.g. ('T','Q',...)
+            sizes = dict(self._analysis_meta['sizes'])   # {'T':4,'Q':16,...}
+
+            for idx, ana in _iter_nested(self._analysis, dims, sizes):
+                if ana._theory is None:
+                    sample_model = SampleModel()
+                else:
+                    sample_model = ana._theory
+
+                    sample_model.add_component(theory)
+                    
+                    ana.set_theory(sample_model)
+
+
+        #     # dims = self._analysis_meta['dims']  # Tuple of dimensions
+        #     # sizes = self._analysis_meta['sizes']  # Sizes for each dimension
+        #     # shape = tuple(sizes[dim] for dim in dims)  # Shape of the array
+        #     iterator=np.ndindex(tuple(self._analysis_meta['sizes'][dim] for dim in self._analysis_meta['dims']))
+
+        #      # Identify the position of `Q` in the dimension order (to map to `Q_index`)
+        #     dims = self._analysis_meta['dims']
+        #     Q_dim_index = dims.index('Q')  # Position of Q in the dimension tuple
+
+        #     for idx in iterator:
+        #         Q_index = idx[Q_dim_index]
+        #         ana=self._analysis(idx)
+        #         if ana._theory is None:
+        #             sample_model=SampleModel()
+        #         else:
+        #             sample_model=ana._theory 
+        #         for comp in components[Q_index]:
+        #             sample_model.add_component(comp)
+        #         ana.set_theory(sample_model)
+
+            
+    
+    # def set_diffusion_model(self,diffusion_model):
+    #     """ Set the diffusion model for all analyses in self._analysis.
+    #     Args:
+    #         diffusion_model (): The diffusion model to be used in the experiment.
+    #     """
+
+
+    def fit_diffusion_width(self,parameter_name):
+        pars=self.get_parameters_as_data_group()
+        if parameter_name not in pars:
+            raise KeyError(f"Parameter '{parameter_name}' not found in fit parameters. Available parameters: {list(pars.keys())}")
+        
+        diffusion_width=pars[parameter_name]['value'].values
+        diffusion_width_var=pars[parameter_name]['value'].variances
+        Q=self._experiment._data.data.coords.get('Q').values
+
+        def fit_func(Q_vals):
+            return self._diffusion_model.calculate_width(Q_vals)
+        
+
+        #TODO: generalize to multiple parameters        
+        fit_obj=ObjBase(name='diffusion_width', diffusion_coefficient=self._diffusion_model.diffusion_coefficient)
+
+        fitter=EasyScienceFitter(
+            fit_object=fit_obj,
+            fit_function=fit_func,
+        )
+
+        fit_result = fitter.fit(x=Q, y=diffusion_width, weights=1.0 / np.sqrt(diffusion_width_var))
+
+        return fit_result
+    
+    def plot_diffusion_fit_result(self,parameter_name):
+        pars=self.get_parameters_as_data_group()
+        diffusion_width=pars[parameter_name]['value'].values
+        diffusion_width_var=pars[parameter_name]['value'].variances
+        Q=self._experiment._data.data.coords.get('Q').values
+
+        theory_width=self._diffusion_model.calculate_width(Q)
+        import matplotlib.pyplot as plt
+        # Plotting code goes here
+        plt.errorbar(Q, diffusion_width, yerr=np.sqrt(diffusion_width_var), fmt='o', label='Fitted Width')
+        plt.plot(Q, theory_width, '-', label='Diffusion Model')
+        plt.xlabel('Q')
+        plt.ylabel('Width')
+        plt.legend()
+        plt.show()
 
     @property
     def analysis(self):

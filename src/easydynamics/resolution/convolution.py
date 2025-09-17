@@ -4,10 +4,10 @@ from scipy.signal import fftconvolve
 from scipy.interpolate import interp1d
 from scipy.special import voigt_profile
 
-from easydynamics.sample import DeltaFunctionComponent
+from easydynamics.sample import DeltaFunction
 from easydynamics.sample.components import ModelComponent  
-from easydynamics.sample import GaussianComponent 
-from easydynamics.sample import LorentzianComponent
+from easydynamics.sample import Gaussian 
+from easydynamics.sample import Lorentzian
 from easydynamics.sample import SampleModel
 
 from easyscience.variable import Parameter
@@ -32,6 +32,8 @@ class ResolutionHandler:
         Accepts SampleModel or ModelComponent for both sample and resolution.
         The analytical method silently falls back to numerical convolution if no analytical expression is found.
         """
+        if not isinstance(x, np.ndarray):
+            raise TypeError(f"`x` is an instance of {type(x).__name__}, but must be a numpy array.")
 
         x = np.asarray(x, dtype=float)
         if x.ndim != 1 or not np.all(np.isfinite(x)):
@@ -151,17 +153,17 @@ class ResolutionHandler:
         # Add delta contributions
         if isinstance(sample_model, SampleModel):
             for comp in sample_model.components.values():
-                if isinstance(comp, DeltaFunctionComponent):
+                if isinstance(comp, DeltaFunction):
                     if selected_component_name is None or comp.name == selected_component_name:
                         convolved += comp.area.value * self._evaluate_any(resolution_model, x_dense - off - comp.center.value)
-        elif isinstance(sample_model, DeltaFunctionComponent):
+        elif isinstance(sample_model, DeltaFunction):
             convolved += sample_model.area.value * self._evaluate_any(resolution_model, x_dense - off - sample_model.center.value)
 
         if isinstance(resolution_model, SampleModel):
             for comp in resolution_model.components.values():
-                if isinstance(comp, DeltaFunctionComponent):
+                if isinstance(comp, DeltaFunction):
                     convolved += comp.area.value * self._evaluate_any(sample_model, x_dense - off - comp.center.value)
-        elif isinstance(resolution_model, DeltaFunctionComponent):
+        elif isinstance(resolution_model, DeltaFunction):
             convolved += resolution_model.area.value * self._evaluate_any(sample_model, x_dense - off - resolution_model.center.value)
 
         #TODO: if both resolution and sample are delta functions, we should let the user know that they are wrong.
@@ -254,30 +256,30 @@ class ResolutionHandler:
         Returns (True, contribution) if handled, else (False, zeros).
         """
         # Delta functions
-        if isinstance(s, DeltaFunctionComponent):
+        if isinstance(s, DeltaFunction):
             return True, s.area.value * r.evaluate(x - s.center.value - off)
 
-        if isinstance(r, DeltaFunctionComponent):
+        if isinstance(r, DeltaFunction):
             return True, r.area.value * s.evaluate(x - r.center.value - off)
 
         # Gaussian + Gaussian --> Gaussian
-        if isinstance(s, GaussianComponent) and isinstance(r, GaussianComponent):
+        if isinstance(s, Gaussian) and isinstance(r, Gaussian):
             width = np.sqrt(s.width.value**2 + r.width.value**2)
             area  = s.area.value * r.area.value
             center = (s.center.value + r.center.value) + off
             return True, self.gaussian_eval(x, center, width, area)
 
         # Lorentzian + Lorentzian --> Lorentzian
-        if isinstance(s, LorentzianComponent) and isinstance(r, LorentzianComponent):
+        if isinstance(s, Lorentzian) and isinstance(r, Lorentzian):
             width = s.width.value + r.width.value
             area  = s.area.value * r.area.value
             center = (s.center.value + r.center.value) + off
             return True, self.lorentzian_eval(x, center, width, area)
 
         # Gaussian + Lorentzian --> Voigt 
-        if (isinstance(s, GaussianComponent) and isinstance(r, LorentzianComponent)) or \
-           (isinstance(s, LorentzianComponent) and isinstance(r, GaussianComponent)):
-            if isinstance(s, GaussianComponent):
+        if (isinstance(s, Gaussian) and isinstance(r, Lorentzian)) or \
+           (isinstance(s, Lorentzian) and isinstance(r, Gaussian)):
+            if isinstance(s, Gaussian):
                 G, L = s, r
             else:
                 G, L = r, s
